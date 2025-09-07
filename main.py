@@ -14,6 +14,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Commented out startup event to avoid timeout during deployment
+# The dataset will be loaded on first request instead
+# @app.on_event("startup")
+# async def startup_event():
+#     """Preload the OSSL dataset on startup to avoid delays on first request."""
+#     try:
+#         print("Loading OSSL dataset...")
+#         get_ossl_cached()
+#         print("OSSL dataset loaded successfully!")
+#     except Exception as e:
+#         print(f"Warning: Failed to preload OSSL dataset: {e}")
+#         print("Dataset will be loaded on first request.")
+
 # Pydantic models for request/response
 class SoilCarbonRequest(BaseModel):
     latitude: float = Field(..., ge=-90, le=90, description="Latitude in decimal degrees")
@@ -24,6 +37,16 @@ class SoilCarbonResponse(BaseModel):
     success: bool
     message: str
     data: Optional[dict] = None
+
+# Global variable to cache the OSSL dataset
+_ossl_cache = None
+
+def get_ossl_cached():
+    """Get OSSL dataset with caching to avoid reloading on every request."""
+    global _ossl_cache
+    if _ossl_cache is None:
+        _ossl_cache = get_ossl()
+    return _ossl_cache
 
 def find_soil_carbon_optimized(lat, lon, max_distance_km=10):
     """
@@ -38,8 +61,8 @@ def find_soil_carbon_optimized(lat, lon, max_distance_km=10):
         dict or str: Dictionary with carbon data or error message
     """
     try:
-        # Load OSSL dataset
-        ossl = get_ossl()
+        # Load OSSL dataset (cached)
+        ossl = get_ossl_cached()
         
         # Get properties with coords and organic carbon
         props = ossl.get_properties([
@@ -124,6 +147,17 @@ async def root():
             "GET /docs": "Interactive API documentation",
             "GET /redoc": "Alternative API documentation"
         }
+    }
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for deployment platforms.
+    """
+    return {
+        "status": "healthy",
+        "message": "API is running",
+        "timestamp": "2024-01-01T00:00:00Z"
     }
 
 @app.post("/soil_carbon", response_model=SoilCarbonResponse)
