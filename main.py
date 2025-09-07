@@ -1,7 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
-import os
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+import numpy as np
+from soilspecdata.datasets.ossl import get_ossl
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -9,6 +13,19 @@ app = FastAPI(
     description="API for querying soil organic carbon data from OSSL dataset",
     version="1.0.0"
 )
+
+# Commented out startup event to avoid timeout during deployment
+# The dataset will be loaded on first request instead
+# @app.on_event("startup")
+# async def startup_event():
+#     """Preload the OSSL dataset on startup to avoid delays on first request."""
+#     try:
+#         print("Loading OSSL dataset...")
+#         get_ossl_cached()
+#         print("OSSL dataset loaded successfully!")
+#     except Exception as e:
+#         print(f"Warning: Failed to preload OSSL dataset: {e}")
+#         print("Dataset will be loaded on first request.")
 
 # Pydantic models for request/response
 class SoilCarbonRequest(BaseModel):
@@ -21,6 +38,101 @@ class SoilCarbonResponse(BaseModel):
     message: str
     data: Optional[dict] = None
 
+# Global variable to cache the OSSL dataset
+_ossl_cache = None
+
+def get_ossl_cached():
+    """Get OSSL dataset with caching to avoid reloading on every request."""
+    global _ossl_cache
+    if _ossl_cache is None:
+        _ossl_cache = get_ossl()
+    return _ossl_cache
+
+def find_soil_carbon_optimized(lat, lon, max_distance_km=10):
+    """
+    Optimized function to find soil carbon data near given coordinates.
+    
+    Args:
+        lat (float): Latitude in decimal degrees
+        lon (float): Longitude in decimal degrees
+        max_distance_km (float): Maximum search distance in kilometers
+        
+    Returns:
+        dict or str: Dictionary with carbon data or error message
+    """
+    try:
+        # Load OSSL dataset (cached)
+        ossl = get_ossl_cached()
+        
+        # Get properties with coords and organic carbon
+        props = ossl.get_properties([
+            'latitude.point_wgs84_dd',
+            'longitude.point_wgs84_dd',
+            'oc_iso.10694_w.pct',
+            'oc_usda.c1059_w.pct',
+            'oc_usda.c729_w.pct'
+        ], require_complete=False)
+        
+        props = props.dropna(subset=['latitude.point_wgs84_dd', 'longitude.point_wgs84_dd'])
+        
+        # Create GeoDataFrame
+        gdf = gpd.GeoDataFrame(
+            props,
+            geometry=gpd.points_from_xy(props['longitude.point_wgs84_dd'], props['latitude.point_wgs84_dd']),
+            crs='EPSG:4326'
+        )
+        
+        # Create input point geometry
+        input_point = Point(lon, lat)
+        input_gdf = gpd.GeoDataFrame(geometry=[input_point], crs='EPSG:4326')
+        
+        # Use spatial index to find candidates within approximate bounding box around input_point
+        # Convert max distance km to degrees roughly (1 deg latitude ~111 km)
+        buffer_deg = max_distance_km / 111.0
+        bbox = input_point.buffer(buffer_deg).bounds  # (minx, miny, maxx, maxy)
+        
+        # Spatial index query
+        sindex = gdf.sindex
+        possible_matches_index = list(sindex.intersection(bbox))
+        possible_matches = gdf.iloc[possible_matches_index]
+        
+        if possible_matches.empty:
+            return f"No Data in {max_distance_km} km radius"
+        
+        # Calculate exact distances in meters by projecting both to EPSG:3857
+        possible_matches_proj = possible_matches.to_crs(epsg=3857)
+        input_gdf_proj = input_gdf.to_crs(epsg=3857)
+        
+        possible_matches_proj['distance_m'] = possible_matches_proj.geometry.distance(input_gdf_proj.iloc[0].geometry)
+        
+        nearby = possible_matches_proj[possible_matches_proj['distance_m'] <= max_distance_km * 1000]
+        
+        if nearby.empty:
+            return f"No Data in {max_distance_km} km radius"
+
+        # Get nearest sample
+        nearest = nearby.sort_values('distance_m').iloc[0]
+        
+        # Find first available carbon value
+        for var in ['oc_iso.10694_w.pct', 'oc_usda.c1059_w.pct', 'oc_usda.c729_w.pct']:
+            val = nearest.get(var)
+            if pd.notnull(val):
+                carbon_val = val
+                break
+        else:
+            return f"No organic carbon data available within {max_distance_km} km"
+        
+        return {
+            'carbon_pct': carbon_val,
+            'sample_id': nearest.name,
+            'distance_meters': nearest['distance_m'],
+            'latitude': nearest['latitude.point_wgs84_dd'],
+            'longitude': nearest['longitude.point_wgs84_dd'],
+        }
+        
+    except Exception as e:
+        raise Exception(f"Error processing soil carbon data: {str(e)}")
+
 @app.get("/")
 async def root():
     """
@@ -29,13 +141,11 @@ async def root():
     return {
         "message": "Welcome to the Soil Carbon API",
         "description": "Query soil organic carbon data from OSSL dataset",
-        "status": "running",
         "endpoints": {
             "GET /": "This welcome message",
             "POST /soil_carbon": "Query soil carbon data by coordinates",
             "GET /docs": "Interactive API documentation",
-            "GET /redoc": "Alternative API documentation",
-            "GET /health": "Health check endpoint"
+            "GET /redoc": "Alternative API documentation"
         }
     }
 
@@ -47,14 +157,19 @@ async def health_check():
     return {
         "status": "healthy",
         "message": "API is running",
-        "service": "soil-carbon-api"
+        "timestamp": "2024-01-01T00:00:00Z"
     }
 
 @app.post("/soil_carbon", response_model=SoilCarbonResponse)
 async def get_soil_carbon(request: SoilCarbonRequest):
     """
     Query soil organic carbon data for given coordinates.
-    This is a simplified version that returns mock data for testing.
+    
+    Args:
+        request (SoilCarbonRequest): Request containing latitude, longitude, and optional max_distance_km
+        
+    Returns:
+        SoilCarbonResponse: Response containing carbon data or error message
     """
     try:
         # Validate coordinates
@@ -70,22 +185,26 @@ async def get_soil_carbon(request: SoilCarbonRequest):
                 detail="Longitude must be between -180 and 180 degrees"
             )
         
-        # For now, return mock data to test the API structure
-        # We'll add the real soil carbon functionality after deployment works
-        mock_data = {
-            "carbon_pct": 2.5,
-            "sample_id": "mock_12345",
-            "distance_meters": 1500.0,
-            "latitude": request.latitude + 0.01,  # Slightly offset
-            "longitude": request.longitude + 0.01,
-            "note": "This is mock data. Real soil carbon functionality will be added after deployment."
-        }
-        
-        return SoilCarbonResponse(
-            success=True,
-            message="Mock soil carbon data returned successfully",
-            data=mock_data
+        # Call the optimized function
+        result = find_soil_carbon_optimized(
+            lat=request.latitude,
+            lon=request.longitude,
+            max_distance_km=request.max_distance_km
         )
+        
+        # Check if result is an error message (string) or data (dict)
+        if isinstance(result, str):
+            return SoilCarbonResponse(
+                success=False,
+                message=result,
+                data=None
+            )
+        else:
+            return SoilCarbonResponse(
+                success=True,
+                message="Soil carbon data found successfully",
+                data=result
+            )
             
     except HTTPException:
         # Re-raise HTTP exceptions
@@ -99,5 +218,6 @@ async def get_soil_carbon(request: SoilCarbonRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
