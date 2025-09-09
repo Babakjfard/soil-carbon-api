@@ -201,7 +201,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- This tool was made at a one-day [Sundai Club](sundai.club) event.
+- This tool was made at a one-day [Sundai Club](https://www.sundai.club/) event.
 - [OSSL (Open Soil Spectral Library)](https://www.soilspectroscopy.org/) for providing the soil data
 - [FastAPI](https://fastapi.tiangolo.com/) for the excellent web framework
 - [soilspecdata](https://pypi.org/project/soilspecdata/) for Python package access to OSSL data
